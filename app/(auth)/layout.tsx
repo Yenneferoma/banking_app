@@ -11,7 +11,7 @@ export default function RootLayout({
       <div className="auth-asset absolute -inset-x-16 right-0">
         <Image
           src="/icons/dashboard.png"
-          alt="Auth image"
+          alt="Auth image asset"
           width={500}
           height={500}
         />
