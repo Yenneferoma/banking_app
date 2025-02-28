@@ -14,6 +14,7 @@ import {
 import { plaidClient } from "@/lib/plaid";
 import { revalidatePath } from "next/cache";
 import { addFundingSource, createDwollaCustomer } from "./dwolla.actions";
+import { sendVerificationEmail } from "@/components/EmailService";
 
 const {
   APPWRITE_DATABASE_ID: DATABASE_ID,
@@ -43,6 +44,14 @@ export const signIn = async ({ email, password }: signInProps) => {
     const { account } = await createAdminClient();
     const session = await account.createEmailPasswordSession(email, password);
 
+    const user = await getUserInfo({ userId: session.userId });
+
+    if (!user?.isVerified) {
+      throw new Error(
+        "Email not verified. Please check your email for the verification code."
+      );
+    }
+
     (await cookies()).set("appwrite-session", session.secret, {
       path: "/",
       httpOnly: true,
@@ -50,11 +59,17 @@ export const signIn = async ({ email, password }: signInProps) => {
       secure: true,
     });
 
-    const user = await getUserInfo({ userId: session.userId });
     return parseStringify(user);
   } catch (error) {
     console.error("Error signing in:", error);
-    return null;
+
+    // Type assertion to extract the error message safely
+    const errorMessage =
+      error instanceof Error
+        ? error.message
+        : "Sign-in failed. Please try again.";
+
+    throw new Error(errorMessage);
   }
 };
 
@@ -81,6 +96,12 @@ export const signUp = async ({ password, ...userData }: SignUpParams) => {
     if (!dwollaCustomerUrl) throw new Error("Error creating Dwolla customer");
 
     const dwollaCustomerId = extractCustomerIdFromUrl(dwollaCustomerUrl);
+
+    // Generate a 6-digit verification token
+    const verificationToken = Math.floor(
+      100000 + Math.random() * 900000
+    ).toString();
+
     const newUser = await database.createDocument(
       DATABASE_ID!,
       USER_COLLECTION_ID!,
@@ -90,21 +111,94 @@ export const signUp = async ({ password, ...userData }: SignUpParams) => {
         userId: newUserAccount.$id,
         dwollaCustomerId,
         dwollaCustomerUrl,
+        verificationToken,
+        isVerified: false,
       }
     );
 
-    const session = await account.createEmailPasswordSession(email, password);
-    (await cookies()).set("appwrite-session", session.secret, {
-      path: "/",
-      httpOnly: true,
-      sameSite: "strict",
-      secure: true,
-    });
+    //Send the verification token to the user's email
+    await sendVerificationEmail(email, verificationToken);
 
-    return parseStringify(newUser);
+    return {
+      newUser,
+      message: "Verification email sent. Please verify before login.",
+    };
   } catch (error) {
     console.error("Error signing up:", error);
     throw new Error("Sign-up failed. Please try again.");
+  }
+};
+
+export const verifyEmail = async ({
+  email,
+  token,
+}: {
+  email: string;
+  token: string;
+}) => {
+  try {
+    const { database } = await createAdminClient();
+
+    // Find the user by email
+    const users = await database.listDocuments(
+      DATABASE_ID!,
+      USER_COLLECTION_ID!,
+      [Query.equal("email", email)]
+    );
+
+    if (!users.documents.length) throw new Error("User not found");
+
+    const user = users.documents[0];
+    console.log("User document:", user);
+
+    if (user.verificationToken !== token) {
+      throw new Error("Invalid verification code");
+    }
+
+    // Update user to mark as verified
+    await database.updateDocument(DATABASE_ID!, USER_COLLECTION_ID!, user.$id, {
+      isVerified: true,
+      verificationToken: "", // Clear the token after successful verification
+    });
+
+    return { message: "Email verified successfully. You can now log in." };
+  } catch (error) {
+    console.error("Error verifying email:", error);
+    throw new Error(
+      error instanceof Error ? error.message : "Email verification failed."
+    );
+  }
+};
+
+export const resendVerificationCode = async (email: string) => {
+  try {
+    const { database } = await createAdminClient();
+
+    // Generate a new verification code
+    const newToken = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // Find user and update the verification token
+    const users = await database.listDocuments(
+      DATABASE_ID!,
+      USER_COLLECTION_ID!,
+      [Query.equal("email", email)]
+    );
+
+    if (!users.documents.length) throw new Error("User not found");
+
+    const user = users.documents[0];
+
+    await database.updateDocument(DATABASE_ID!, USER_COLLECTION_ID!, user.$id, {
+      verificationToken: newToken,
+    });
+
+    // Resend verification email
+    await sendVerificationEmail(email, newToken);
+
+    return { message: "Verification code resent successfully." };
+  } catch (error) {
+    console.error("Error resending verification code:", error);
+    throw new Error("Failed to resend verification code. Try again later.");
   }
 };
 
@@ -129,23 +223,30 @@ export const logoutAccount = async () => {
     return null;
   }
 };
-
-export const createLinkToken = async (user: User) => {
+export const createLinkToken = async (user: any) => {
   try {
+    const userId = user?.newUser?.$id || user?.$id;
+    if (!userId) throw new Error("Invalid user ID");
+
+    const clientName =
+      user?.newUser?.firstName && user?.newUser?.lastName
+        ? `${user.newUser.firstName} ${user.newUser.lastName}`
+        : "User";
+
     const tokenParams = {
-      user: {
-        client_user_id: user.$id,
-      },
-      client_name: `${user.firstName} ${user.lastName}`,
-      products: ["auth", "transactions"] as Products[], // ✅ Added "transactions"
+      user: { client_user_id: userId },
+      client_name: clientName,
+      products: ["auth", "transactions"] as Products[],
       language: "en",
       country_codes: ["US"] as CountryCode[],
     };
 
     const response = await plaidClient.linkTokenCreate(tokenParams);
-    return parseStringify({ linkToken: response.data.link_token });
-  } catch (error) {
-    console.error("Error creating link token:", error);
+
+    return { linkToken: response.data.link_token };
+  } catch (error: any) {
+    console.error("Error creating link token:", error.response?.data || error);
+    throw new Error("Failed to create Plaid link token.");
   }
 };
 

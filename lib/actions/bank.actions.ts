@@ -174,8 +174,6 @@ export const getTransactions = async ({
     await checkItemProducts(accessToken);
 
     while (hasMore) {
-      console.log("Access Token:", accessToken);
-
       const response = await plaidClient.transactionsSync({
         access_token: accessToken,
       });
